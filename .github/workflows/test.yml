@@ -1,0 +1,36 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: boggle
+          POSTGRES_PASSWORD: test-only-password
+          POSTGRES_DB: boggle_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U boggle -d boggle_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+        env:
+          TEST_DATABASE_URL: postgresql://boggle:test-only-password@127.0.0.1:5432/boggle_test

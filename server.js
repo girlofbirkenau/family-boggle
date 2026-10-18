@@ -10,6 +10,9 @@ const path = require("path");
 const zlib = require("zlib");
 const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
+const { PostgresStore } = require("./postgres-store");
+const { encodeBackup, writeVerifiedBackup } = require("./state-backup");
+const { validStats, validRejected: validRej } = require("./state-validation");
 
 const PORT = Number(process.env.PORT) || 3000;
 // Page files normally live in ./public. If they were uploaded flat next to server.js, use those.
@@ -183,6 +186,7 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const STATS_FILE = path.join(DATA_DIR, "stats.json");
 const GIST_NAME = "family-boggle-stats.json";
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
+const DATABASE_URL = process.env.DATABASE_URL || "";
 const GITHUB_API = (process.env.GITHUB_API_BASE || "https://api.github.com").replace(/\/$/, "");
 const PUSH_DELAY_MS = Number(process.env.BOGGLE_BACKUP_DELAY_MS) || 15000;
 let gistId = process.env.GIST_ID || "";
@@ -194,10 +198,19 @@ const REJ_MAX = 5000;
 let rejected = { version: 1, updatedAt: 0, words: {} };
 let pushTimer = null, pushing = false, pushAgain = false;
 const backupInfo = { enabled: !!GITHUB_TOKEN, lastOk: 0, lastError: "" };
+let database = null;
+// Database errors may contain connection details: log a code, never the URL.
+function databaseFailed(error) {
+  console.error("PostgreSQL persistence failed (" + (error.code || "database error") + "); stopping to avoid accepting unsaved games");
+  process.exit(1);
+}
 
-function validStats(o) { return o && typeof o === "object" && o.rooms && typeof o.rooms === "object"; }
 function loadStatsFile() {
-  try { const o = JSON.parse(fs.readFileSync(STATS_FILE, "utf8")); return validStats(o) ? o : null; } catch (e) { return null; }
+  try {
+    const o = JSON.parse(fs.readFileSync(STATS_FILE, "utf8"));
+    if (!validStats(o) && DATABASE_URL) throw new Error("Invalid legacy stats file");
+    return validStats(o) ? o : null;
+  } catch (e) { if (DATABASE_URL && e.code !== "ENOENT") throw e; return null; }
 }
 function writeStatsFile() {
   try {
@@ -229,7 +242,6 @@ async function findGist() {
   }
   return "";
 }
-function validRej(o) { return o && typeof o === "object" && o.words && typeof o.words === "object"; }
 let rejBackup = null;
 async function pullBackup() {
   if (!GITHUB_TOKEN) return null;
@@ -237,10 +249,22 @@ async function pullBackup() {
     const id = await findGist();
     if (!id) return null;
     const g = await gh("/gists/" + id);
-    try { const rf = g.files && g.files[REJ_GIST]; if (rf && typeof rf.content === "string") { const o = JSON.parse(rf.content); if (validRej(o)) rejBackup = o; } } catch (e) { /* ignore */ }
+    try {
+      const rf = g.files && g.files[REJ_GIST];
+      if (rf) {
+        if (rf.truncated || typeof rf.content !== "string") throw new Error("Incomplete rejected-word backup");
+        const o = JSON.parse(rf.content);
+        if (!validRej(o)) throw new Error("Invalid rejected-word backup");
+        rejBackup = o;
+      }
+    } catch (e) { if (DATABASE_URL) throw e; }
     const f = g.files && g.files[GIST_NAME];
-    if (!f || typeof f.content !== "string") return null;
+    if (!f || f.truncated || typeof f.content !== "string") {
+      if (DATABASE_URL) throw new Error("Missing or incomplete stats backup");
+      return null;
+    }
     const o = JSON.parse(f.content);
+    if (DATABASE_URL && !validStats(o)) throw new Error("Invalid stats backup");
     return validStats(o) ? o : null;
   } catch (e) { backupInfo.lastError = String(e.message || e); console.log("Backup read failed: " + backupInfo.lastError); return null; }
 }
@@ -249,6 +273,7 @@ async function pushBackup() {
   if (pushing) { pushAgain = true; return; }
   pushing = true;
   try {
+    if (database) await database.flush();
     const content = JSON.stringify(stats);
     const rcontent = JSON.stringify(rejected);
     let id = await findGist();
@@ -265,7 +290,11 @@ async function pushBackup() {
 }
 function scheduleBackup() { if (!GITHUB_TOKEN || pushTimer) return; pushTimer = setTimeout(() => { pushTimer = null; pushBackup(); }, PUSH_DELAY_MS); }
 async function flushBackup() { if (pushTimer) { clearTimeout(pushTimer); pushTimer = null; } await pushBackup(); }
-function saveStats() { stats.updatedAt = Date.now(); writeStatsFile(); scheduleBackup(); }
+function saveStats() {
+  stats.updatedAt = Math.max(Date.now(), stats.updatedAt + 1);
+  if (database) database.save(stats, rejected).then(() => { if (!database.failure) scheduleBackup(); });
+  else { writeStatsFile(); scheduleBackup(); }
+}
 function writeRejFile() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -274,7 +303,11 @@ function writeRejFile() {
     fs.renameSync(tmp, REJ_FILE);
   } catch (e) { console.log("Could not write " + REJ_FILE + ": " + e.message); }
 }
-function saveRejected() { rejected.updatedAt = Date.now(); writeRejFile(); scheduleBackup(); }
+function saveRejected() {
+  rejected.updatedAt = Date.now();
+  if (database) database.save(stats, rejected).then(() => { if (!database.failure) scheduleBackup(); });
+  else { writeRejFile(); scheduleBackup(); }
+}
 function handleReject(r, p, m) {
   const w = String(m.word || "").toLowerCase();
   if (!p.name || !/^[a-z]{3,16}$/.test(w) || WORDSET.has(w)) return;
@@ -291,15 +324,37 @@ function handleReject(r, p, m) {
 function rejectedList(min) {
   return Object.entries(rejected.words).filter(([w, e]) => e.n >= min).sort((a, b) => b[1].n - a[1].n || a[0].localeCompare(b[0]));
 }
-async function initStats() {
-  try { const o = JSON.parse(fs.readFileSync(REJ_FILE, "utf8")); if (validRej(o)) rejected = o; } catch (e) { /* none yet */ }
+async function loadLegacyState() {
+  try {
+    const o = JSON.parse(fs.readFileSync(REJ_FILE, "utf8"));
+    if (validRej(o)) rejected = o;
+    else if (DATABASE_URL) throw new Error("Invalid legacy rejected-word file");
+  } catch (e) { if (DATABASE_URL && e.code !== "ENOENT") throw e; }
   const local = loadStatsFile();
-  const backup = await Promise.race([pullBackup(), new Promise((r) => setTimeout(() => r(null), 12000))]);
+  let timeout;
+  const backup = DATABASE_URL ? await pullBackup() : await Promise.race([pullBackup(), new Promise((r) => { timeout = setTimeout(() => r(null), 12000); })]);
+  clearTimeout(timeout);
+  // An empty database must not turn a temporary Gist outage into an empty
+  // permanent import. Fix the backup connection and restart before playing.
+  if (DATABASE_URL && backupInfo.lastError) throw new Error("Legacy backup could not be read; retry migration before starting");
   const best = [local, backup].filter(Boolean).sort((x, y) => (y.updatedAt || 0) - (x.updatedAt || 0))[0];
   if (best) stats = best;
-  if (best && best === backup) writeStatsFile();
-  if (rejBackup && (rejBackup.updatedAt || 0) > (rejected.updatedAt || 0)) { rejected = rejBackup; writeRejFile(); }
+  if (!DATABASE_URL && best && best === backup) writeStatsFile();
+  if (rejBackup && (rejBackup.updatedAt || 0) > (rejected.updatedAt || 0)) { rejected = rejBackup; if (!DATABASE_URL) writeRejFile(); }
   console.log("Stats loaded (" + (best === backup && backup ? "from backup" : best ? "from disk" : "new") + "), rooms: " + Object.keys(stats.rooms).length + (GITHUB_TOKEN ? ", GitHub backup on" : ", GitHub backup off (set GITHUB_TOKEN to turn on)"));
+  return { stats, rejected };
+}
+async function initStats() {
+  if (!DATABASE_URL) { await loadLegacyState(); return; }
+  database = new PostgresStore(DATABASE_URL, databaseFailed);
+  const state = await database.init(loadLegacyState, state => {
+    const file = writeVerifiedBackup(process.env.BOGGLE_BACKUP_DIR, state);
+    console.log("Verified pre-import backup saved to " + file);
+  });
+  if (!validStats(state.stats) || !validRej(state.rejected)) throw new Error("Invalid PostgreSQL state");
+  stats = state.stats;
+  rejected = state.rejected;
+  console.log("Stats loaded from PostgreSQL, rooms: " + Object.keys(stats.rooms).length);
 }
 
 const nameKey = (n) => String(n || "").trim().toLowerCase().slice(0, 24);
@@ -354,7 +409,7 @@ function recordRound(r, g, inRound, totals, winners) {
 }
 
 function finalize(r, g) {
-  if (r.game !== g || g.results) return;
+  if (stopping || r.game !== g || g.results) return;
   const inRound = [...r.players.values()].filter((p) => p.gid === g.id);
   const totals = scoreRound(g.board, inRound);
   const top = Math.max(0, ...totals.values());
@@ -501,6 +556,7 @@ function handleBurst(r, p, m) {
 }
 
 function handle(r, ws, m) {
+  if (stopping) return;
   if (m.t === "ping") { sendRaw(ws, { t: "pong" }); return; } // lets a phone check that its connection is really alive
   if (m.t === "hello") {
     const key = String(m.key || "").slice(0, 64);
@@ -576,12 +632,22 @@ files["/"] = files["/index.html"];
 
 // Admin credentials are sent only in an Authorization header and never stored by the page.
 const ADMIN_PASSWORD = process.env.BOGGLE_ADMIN_PASSWORD || "";
+let adminWritePending = false;
 const adminDigest = s => crypto.createHash("sha256").update(s).digest();
 async function handleAdmin(req, res, url) {
   const reply = (code, body) => { res.writeHead(code, {"content-type":"application/json", "cache-control":"no-store", "x-content-type-options":"nosniff"}); res.end(JSON.stringify(body)); };
   if (!ADMIN_PASSWORD) return reply(503, {error:"Set BOGGLE_ADMIN_PASSWORD on the server to enable admin access."});
   const supplied = (req.headers.authorization || "").replace(/^Bearer /, "");
   if (!crypto.timingSafeEqual(adminDigest(supplied), adminDigest(ADMIN_PASSWORD))) return reply(401, {error:"Incorrect admin password."});
+  if (stopping) return reply(503,{error:"Server is stopping. Try again after restart."});
+  if (url.pathname === "/api/admin/backup" && req.method === "GET") {
+    try {
+      if (database) await database.flush();
+      const backup = encodeBackup({stats,rejected});
+      res.writeHead(200,{"content-type":"application/json", "cache-control":"no-store", "content-disposition":'attachment; filename="family-boggle-backup-'+Date.now()+'.json"', "x-content-type-options":"nosniff"});
+      res.end(backup); return;
+    } catch(e) { return reply(503,{error:"Backup could not be created."}); }
+  }
   if (url.pathname === "/api/admin/players" && req.method === "GET") {
     return reply(200, {updatedAt:stats.updatedAt, rooms:Object.entries(stats.rooms).map(([name, room]) => ({name, players:Object.entries(room.players).map(([key, p]) => ({...p,key}))}))});
   }
@@ -589,7 +655,8 @@ async function handleAdmin(req, res, url) {
   try {
     let body = "";
     for await (const chunk of req) { body += chunk; if (Buffer.byteLength(body) > 4096) return reply(413, {error:"Request too large."}); }
-    const m = JSON.parse(body), room = stats.rooms[m.room];
+    if (adminWritePending) return reply(409,{error:"Another merge is being saved. Refresh and try again."});
+    const m = JSON.parse(body), room = Object.hasOwn(stats.rooms,m.room) ? stats.rooms[m.room] : null;
     if (!room || typeof m.source !== "string" || typeof m.target !== "string" || m.source === m.target || !Object.hasOwn(room.players,m.source) || !Object.hasOwn(room.players,m.target)) return reply(400,{error:"Select two different existing players in the same room."});
     if (m.updatedAt !== stats.updatedAt) return reply(409,{error:"Stats changed. Refresh and review the preview again."});
     const live = rooms.get(m.room);
@@ -608,11 +675,22 @@ async function handleAdmin(req, res, url) {
     for (const key of Object.keys(r.aliases)) if (r.aliases[key] === m.source) r.aliases[key]=m.target;
     r.aliases[m.source]=m.target;
     next.updatedAt=Math.max(Date.now(),stats.updatedAt+1);
-    // Persist before publishing: a failed write leaves the original stats untouched.
-    fs.mkdirSync(DATA_DIR,{recursive:true});
-    fs.writeFileSync(STATS_FILE+".tmp",JSON.stringify(next));
-    fs.renameSync(STATS_FILE+".tmp",STATS_FILE);
-    stats=next; scheduleBackup();
+    // A successful response requires a saved snapshot in the authoritative store.
+    if (database) {
+      // Queue the snapshot and publish the new identity mapping synchronously, so
+      // rounds in other rooms cannot overwrite it while database I/O is pending.
+      adminWritePending = true;
+      const saved = database.save(next,rejected);
+      stats = next;
+      try { await saved; if (database.failure) throw database.failure; }
+      finally { adminWritePending = false; }
+    } else {
+      fs.mkdirSync(DATA_DIR,{recursive:true});
+      fs.writeFileSync(STATS_FILE+".tmp",JSON.stringify(next));
+      fs.renameSync(STATS_FILE+".tmp",STATS_FILE);
+      stats = next;
+    }
+    scheduleBackup();
     if (live) broadcastRaw(live,{t:"stats",stats:boardFor(m.room)});
     return reply(200,{ok:true,name:b.name});
   } catch(e) { return reply(400,{error:e instanceof SyntaxError ? "Invalid request." : "Merge could not be saved. Original records were kept."}); }
@@ -688,13 +766,25 @@ setInterval(() => {
   for (const [k, r] of rooms) if (r.touched < cutoff && ![...r.players.values()].some((p) => p.ws)) rooms.delete(k);
 }, 3600 * 1000);
 
-initStats().catch((e) => console.log("Stats init failed: " + e.message)).then(() => {
+initStats().then(() => {
   server.listen(PORT, () => console.log("Family Boggle listening on port " + PORT));
+}).catch((e) => {
+  // Never start an apparently empty server when configured persistence fails.
+  if (DATABASE_URL) databaseFailed(e);
+  console.error("Stats init failed: " + e.message);
+  process.exit(1);
 });
 // Render (and Docker) send SIGTERM before stopping: save everything first
 let stopping = false;
 for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => {
   if (stopping) return; stopping = true;
-  writeStatsFile();
-  Promise.race([flushBackup(), new Promise((r) => setTimeout(r, 8000))]).then(() => process.exit(0));
+  server.close();
+  for (const ws of wss.clients) ws.terminate();
+  async function finish() {
+    if (database) await database.close();
+    else { writeStatsFile(); writeRejFile(); }
+    await flushBackup();
+  }
+  const deadline = setTimeout(() => { console.error("Persistence shutdown timed out"); process.exit(1); }, 15000);
+  finish().then(() => { clearTimeout(deadline); process.exit(0); }, () => { clearTimeout(deadline); process.exit(1); });
 });

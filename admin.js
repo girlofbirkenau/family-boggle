@@ -34,3 +34,5 @@ $('#confirm').onchange=()=>{$('#merge').disabled=!$('#confirm').checked||!$('#pr
 $('#refresh').onclick=async()=>{try{await refresh();status('Players refreshed.');}catch(e){status(e.message);}};
 $('#merge').onclick=async()=>{const body={room:$('#room').value,source:$('#source').value,target:$('#target').value,updatedAt:data.updatedAt};$('#merge').disabled=true;try{const result=await api('merge',body);await refresh();status('Merged into '+result.name+'. Original records archived.');}catch(e){$('#confirm').checked=false;status(e.message);}};
 $('#lock').onclick=()=>{password='';data=null;$('#tools').hidden=true;$('#login').hidden=false;$('#preview').replaceChildren();status('Admin locked.');};
+
+$('#backup').onclick=async()=>{try{const backup=await api('backup');const blob=new Blob([JSON.stringify(backup)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='family-boggle-backup-'+Date.now()+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);status('Backup download started. Keep a copy outside the server.');}catch(e){status(e.message);}};

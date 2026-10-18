@@ -15,7 +15,7 @@ const board = ['qu', 'e', 'e', 'n', 'a', 't', 'x', 'x', ...Array(8).fill('x')];
 function setup() {
   const dictionary = new Set(['queen', 'tea', 'eat', 'qat', 'ququ', 'zoo']);
   const stats = { players: {} };
-  const ctx = { WORDSET: dictionary, DICT: dictionary, board, stats,
+  const ctx = { stopping: false, WORDSET: dictionary, DICT: dictionary, board, stats,
     statRoom: () => stats, nameKey: n => n.toLowerCase(), saveStats() {}, broadcast() {}, broadcastRaw() {}, boardFor: () => stats };
   vm.createContext(ctx);
   vm.runInContext(section(server, 'const NB =', 'function analyze') +
